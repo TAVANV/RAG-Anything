@@ -201,38 +201,30 @@ class PoolingMixin:
 
 # Utility functions for pool management
 
-def create_instance_key(workspace: str, tenant_id: Optional[str] = None) -> str:
+def create_instance_key(workspace: str) -> str:
     """
-    Create unique key for instance lookup
-    
+    Create unique key for instance lookup based on workspace
+
     Args:
-        workspace: Workspace directory
-        tenant_id: Optional tenant identifier
-        
+        workspace: Workspace directory (unique identifier)
+
     Returns:
-        str: Unique instance key
+        str: Unique instance key (MD5 hash of workspace)
     """
-    key_parts = [workspace]
-    if tenant_id:
-        key_parts.append(tenant_id)
-    
-    key_string = "|".join(key_parts)
-    return hashlib.md5(key_string.encode()).hexdigest()
+    return hashlib.md5(workspace.encode()).hexdigest()
 
 
-def parse_instance_key(key: str) -> Tuple[str, Optional[str]]:
+def parse_instance_key(key: str) -> str:
     """
-    Parse instance key to extract components
-    
+    Parse instance key (returns key itself as MD5 cannot be reversed)
+
     Args:
-        key: Instance key
-        
+        key: Instance key (MD5 hash)
+
     Returns:
-        tuple: (workspace, tenant_id)
+        str: The key itself (for display purposes)
     """
-    # This is a simplified version - in production would need reverse mapping
-    # For now, return placeholder values
-    return ("workspace", None)
+    return key
 
 
 async def warm_up_instance(poolable: PoolableRAGAnything) -> bool:
