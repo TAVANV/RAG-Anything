@@ -6,6 +6,7 @@ This module provides pooling capabilities without modifying core RAG-Anything/Li
 import asyncio
 import hashlib
 import time
+import threading
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -45,17 +46,31 @@ class PoolableRAGAnything:
         """
         self.instance = instance
         self.state = state
-        self._lock = asyncio.Lock()
-        
+        # 使用 threading.Lock 替代 asyncio.Lock，因为需要跨任务释放
+        self._lock = threading.Lock()
+        self._lock_acquired = False
+
     async def acquire(self):
         """Acquire lock for exclusive access"""
-        await self._lock.acquire()
-        self.state.update_usage()
-        
+        # 在异步环境中使用线程锁，通过 executor 避免阻塞
+        loop = asyncio.get_event_loop()
+        # threading.Lock 在 Python 3.2+ 支持 timeout 参数
+        acquired = await loop.run_in_executor(None, lambda: self._lock.acquire(timeout=30.0))
+        if acquired:
+            self._lock_acquired = True
+            self.state.update_usage()
+        else:
+            raise TimeoutError("Failed to acquire instance lock within 30 seconds")
+
     def release(self):
-        """Release lock after usage"""
-        if self._lock.locked():
-            self._lock.release()
+        """Release lock after usage - now safe across tasks"""
+        if self._lock_acquired and self._lock.locked():
+            try:
+                self._lock.release()
+                self._lock_acquired = False
+            except RuntimeError as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Lock release error: {e}")
             
     async def health_check(self) -> bool:
         """
@@ -264,22 +279,36 @@ class PoolableLightRAG:
         """
         self.instance = instance
         self.state = state
-        self._lock = asyncio.Lock()
+        # 使用 threading.Lock 替代 asyncio.Lock，因为需要跨任务释放
+        self._lock = threading.Lock()
+        self._lock_acquired = False
         self._reference_count = 0
-        
+
     async def acquire(self):
         """Acquire lock for exclusive access"""
-        await self._lock.acquire()
-        self.state.update_usage()
-        # Atomic increment
-        self._reference_count += 1
-        
+        # 在异步环境中使用线程锁，通过 executor 避免阻塞
+        loop = asyncio.get_event_loop()
+        # threading.Lock 在 Python 3.2+ 支持 timeout 参数
+        acquired = await loop.run_in_executor(None, lambda: self._lock.acquire(timeout=30.0))
+        if acquired:
+            self._lock_acquired = True
+            self.state.update_usage()
+            # Atomic increment
+            self._reference_count += 1
+        else:
+            raise TimeoutError("Failed to acquire LightRAG instance lock within 30 seconds")
+
     def release(self):
-        """Release lock after usage"""
-        if self._lock.locked():
-            # Atomic decrement with minimum bound
-            self._reference_count = max(0, self._reference_count - 1)
-            self._lock.release()
+        """Release lock after usage - now safe across tasks"""
+        if self._lock_acquired and self._lock.locked():
+            try:
+                # Atomic decrement with minimum bound
+                self._reference_count = max(0, self._reference_count - 1)
+                self._lock.release()
+                self._lock_acquired = False
+            except RuntimeError as e:
+                import logging
+                logging.getLogger(__name__).warning(f"LightRAG lock release error: {e}")
             
     async def health_check(self) -> bool:
         """
