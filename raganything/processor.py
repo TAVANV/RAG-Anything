@@ -844,9 +844,16 @@ class ProcessorMixin:
         chunk_ids = list(lightrag_chunks.keys())
 
         # Stage 4: Use LightRAG's batch entity relation extraction
-        chunk_results = await self._batch_extract_entities_lightrag_style_type_aware(
-            lightrag_chunks
-        )
+        # Skip if no chunks (e.g., pure image with no extracted text)
+        if not lightrag_chunks:
+            self.logger.warning(
+                "No chunks available for entity extraction, skipping this step"
+            )
+            chunk_results = []
+        else:
+            chunk_results = await self._batch_extract_entities_lightrag_style_type_aware(
+                lightrag_chunks
+            )
 
         # Stage 5: Add belongs_to relations (multimodal-specific)
         enhanced_chunk_results = await self._batch_add_belongs_to_relations_type_aware(
@@ -1152,6 +1159,13 @@ class ProcessorMixin:
         self, lightrag_chunks: Dict[str, Any]
     ) -> List[Tuple]:
         """Use LightRAG's extract_entities for batch entity relation extraction"""
+        # Early return if no chunks
+        if not lightrag_chunks:
+            self.logger.warning(
+                "No chunks provided for entity extraction, returning empty results"
+            )
+            return []
+
         from lightrag.kg.shared_storage import (
             get_namespace_data,
             get_pipeline_status_lock,
@@ -1319,10 +1333,26 @@ class ProcessorMixin:
         try:
             current_doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
             if current_doc_status:
+                # Check if this is a pure multimodal document (no text content)
+                current_status = current_doc_status.get("status", "")
+                content_length = current_doc_status.get("content_length", 0)
+
+                # For pure multimodal documents (content_length == 0),
+                # update status to "processed" when multimodal processing is done
+                if content_length == 0 and current_status == "pending":
+                    final_status = "processed"
+                    self.logger.info(
+                        f"Marking pure multimodal document {doc_id} as 'processed'"
+                    )
+                else:
+                    # Keep existing status for text documents
+                    final_status = current_status
+
                 await self.lightrag.doc_status.upsert(
                     {
                         doc_id: {
                             **current_doc_status,
+                            "status": final_status,
                             "multimodal_processed": True,
                             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
                         }
@@ -1471,9 +1501,11 @@ class ProcessorMixin:
                 content_list, self.config.content_format
             )
 
-        # Step 3: Insert pure text content with all parameters
+        # Step 3: Insert text content or create doc_status for pure multimodal documents
+        file_name = os.path.basename(file_path)
+
         if text_content.strip():
-            file_name = os.path.basename(file_path)
+            # Insert actual text content (this will create doc_status automatically)
             await insert_text_content(
                 self.lightrag,
                 input=text_content,
@@ -1482,6 +1514,30 @@ class ProcessorMixin:
                 split_by_character_only=split_by_character_only,
                 ids=doc_id,
             )
+        else:
+            # For pure multimodal documents (e.g., pure images), manually create doc_status
+            # without going through text insertion to avoid "empty chunks" error
+            self.logger.info(f"No text content found for {file_path}, creating doc_status for multimodal-only document")
+
+            import time
+            from datetime import datetime, timezone
+
+            # Create initial doc_status entry directly
+            await self.lightrag.doc_status.upsert(
+                {
+                    doc_id: {
+                        "status": "pending",  # Will be updated after multimodal processing
+                        "content_summary": "",
+                        "content_length": 0,
+                        "chunks_count": 0,
+                        "chunks_list": [],
+                        "file_path": file_name,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                }
+            )
+            self.logger.info(f"Created doc_status for multimodal-only document: {doc_id}")
 
         # Step 4: Process multimodal content (using specialized processors)
         if multimodal_items:

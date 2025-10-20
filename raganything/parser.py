@@ -1110,27 +1110,67 @@ class MineruParser(Parser):
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """
-        Parse text file by first converting to PDF, then parsing with MinerU 2.0
+        Parse text file directly without PDF conversion (optimized for RAG)
 
         Supported formats: .txt, .md
 
         Args:
             text_path: Path to the text file (.txt, .md)
             output_dir: Output directory path
-            lang: Document language for OCR optimization
-            **kwargs: Additional parameters for mineru command
+            lang: Document language (unused, kept for API compatibility)
+            **kwargs: Additional parameters (unused, kept for API compatibility)
 
         Returns:
             List[Dict[str, Any]]: List of content blocks
         """
-        try:
-            # Convert text file to PDF using base class method
-            pdf_path = self.convert_text_to_pdf(text_path, output_dir)
+        # Suppress unused parameter warnings - kept for API compatibility
+        _ = lang, kwargs
 
-            # Parse the converted PDF
-            return self.parse_pdf(
-                pdf_path=pdf_path, output_dir=output_dir, lang=lang, **kwargs
+        try:
+            text_path = Path(text_path)
+            if not text_path.exists():
+                raise FileNotFoundError(f"Text file does not exist: {text_path}")
+
+            # Read text content with multiple encoding support
+            text_content = None
+            for encoding in ["utf-8", "gbk", "latin-1", "cp1252"]:
+                try:
+                    with open(text_path, "r", encoding=encoding) as f:
+                        text_content = f.read()
+                    logging.info(f"Successfully read {text_path.name} with {encoding} encoding")
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if text_content is None:
+                raise RuntimeError(
+                    f"Could not decode text file {text_path.name} with any supported encoding"
+                )
+
+            # Construct content_list in MinerU-compatible format
+            content_list = [{
+                "type": "text",
+                "text": text_content,
+                "page_idx": 0  # Text files are treated as single page
+            }]
+
+            # Optionally save to JSON for consistency with MinerU output
+            if output_dir:
+                output_path = Path(output_dir)
+                output_path.mkdir(parents=True, exist_ok=True)
+
+                json_output = output_path / f"{text_path.stem}_content_list.json"
+                with open(json_output, "w", encoding="utf-8") as f:
+                    json.dump(content_list, f, ensure_ascii=False, indent=2)
+
+                logging.info(f"Saved content_list to: {json_output}")
+
+            logging.info(
+                f"Successfully parsed text file: {text_path.name} "
+                f"({len(text_content)} characters)"
             )
+
+            return content_list
 
         except Exception as e:
             logging.error(f"Error in parse_text_file: {str(e)}")
