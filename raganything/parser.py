@@ -18,6 +18,7 @@ import base64
 import subprocess
 import tempfile
 import logging
+import threading
 from pathlib import Path
 from typing import (
     Dict,
@@ -30,6 +31,13 @@ from typing import (
 )
 
 T = TypeVar("T")
+
+# 全局 LibreOffice 转换信号量（限制并发数，防止冲突）
+# LibreOffice headless 模式对并发有限制，使用信号量控制最大并发数
+# 经验值：macOS/Linux 建议 1-2，Windows 建议 1
+import os
+_max_concurrent_libreoffice = int(os.getenv("LIBREOFFICE_MAX_CONCURRENT", "1"))
+_libreoffice_semaphore = threading.Semaphore(_max_concurrent_libreoffice)
 
 
 class MineruExecutionError(Exception):
@@ -97,80 +105,102 @@ class Parser:
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_path = Path(temp_dir)
 
-                # Convert to PDF using LibreOffice
+                # Convert to PDF using LibreOffice (使用信号量限制并发数)
                 logging.info(f"Converting {doc_path.name} to PDF using LibreOffice...")
 
-                # Prepare subprocess parameters to hide console window on Windows
-                import platform
+                # 使用信号量限制 LibreOffice 并发数（防止配置文件锁冲突）
+                with _libreoffice_semaphore:
+                    logging.debug(f"Acquired LibreOffice semaphore for {doc_path.name} "
+                                f"(max concurrent: {_max_concurrent_libreoffice})")
 
-                # Try LibreOffice commands in order of preference
-                commands_to_try = ["libreoffice", "soffice"]
+                    # Prepare subprocess parameters to hide console window on Windows
+                    import platform
 
-                conversion_successful = False
-                for cmd in commands_to_try:
-                    try:
-                        convert_cmd = [
-                            cmd,
-                            "--headless",
-                            "--convert-to",
-                            "pdf",
-                            "--outdir",
-                            str(temp_path),
-                            str(doc_path),
-                        ]
+                    # Try LibreOffice commands in order of preference
+                    commands_to_try = ["libreoffice", "soffice"]
 
-                        # Prepare conversion subprocess parameters
-                        convert_subprocess_kwargs = {
-                            "capture_output": True,
-                            "text": True,
-                            "timeout": 60,  # 60 second timeout
-                            "encoding": "utf-8",
-                            "errors": "ignore",
-                        }
+                    conversion_successful = False
+                    for cmd in commands_to_try:
+                        try:
+                            # Create a unique temporary user profile for this conversion
+                            # This prevents lock file conflicts and state pollution between conversions
+                            with tempfile.TemporaryDirectory() as user_profile_dir:
+                                convert_cmd = [
+                                    cmd,
+                                    "--headless",
+                                    "--convert-to",
+                                    "pdf",
+                                    "--outdir",
+                                    str(temp_path),
+                                    "-env:UserInstallation=file://" + str(Path(user_profile_dir).absolute()),
+                                    str(doc_path),
+                                ]
 
-                        # Hide console window on Windows
-                        if platform.system() == "Windows":
-                            convert_subprocess_kwargs["creationflags"] = (
-                                subprocess.CREATE_NO_WINDOW
+                                # Prepare conversion subprocess parameters
+                                convert_subprocess_kwargs = {
+                                    "capture_output": True,
+                                    "text": True,
+                                    "timeout": 60,  # 60 second timeout
+                                    "encoding": "utf-8",
+                                    "errors": "ignore",
+                                }
+
+                                # Hide console window on Windows
+                                if platform.system() == "Windows":
+                                    convert_subprocess_kwargs["creationflags"] = (
+                                        subprocess.CREATE_NO_WINDOW
+                                    )
+
+                                result = subprocess.run(
+                                    convert_cmd, **convert_subprocess_kwargs
+                                )
+
+                                if result.returncode == 0:
+                                    conversion_successful = True
+                                    logging.info(
+                                        f"Successfully converted {doc_path.name} to PDF using {cmd}\n"
+                                        f"  stdout: {result.stdout}\n"
+                                        f"  stderr: {result.stderr}"
+                                    )
+                                    break
+                                else:
+                                    logging.warning(
+                                        f"LibreOffice command '{cmd}' failed (returncode={result.returncode}):\n"
+                                        f"  stdout: {result.stdout}\n"
+                                        f"  stderr: {result.stderr}"
+                                    )
+                        except FileNotFoundError:
+                            logging.warning(f"LibreOffice command '{cmd}' not found")
+                        except subprocess.TimeoutExpired:
+                            logging.warning(f"LibreOffice command '{cmd}' timed out")
+                        except Exception as e:
+                            logging.error(
+                                f"LibreOffice command '{cmd}' failed with exception: {e}"
                             )
 
-                        result = subprocess.run(
-                            convert_cmd, **convert_subprocess_kwargs
+                    if not conversion_successful:
+                        raise RuntimeError(
+                            f"LibreOffice conversion failed for {doc_path.name}. "
+                            f"Please ensure LibreOffice is installed:\n"
+                            "- Windows: Download from https://www.libreoffice.org/download/download/\n"
+                            "- macOS: brew install --cask libreoffice\n"
+                            "- Ubuntu/Debian: sudo apt-get install libreoffice\n"
+                            "- CentOS/RHEL: sudo yum install libreoffice\n"
+                            "Alternatively, convert the document to PDF manually."
                         )
-
-                        if result.returncode == 0:
-                            conversion_successful = True
-                            logging.info(
-                                f"Successfully converted {doc_path.name} to PDF using {cmd}"
-                            )
-                            break
-                        else:
-                            logging.warning(
-                                f"LibreOffice command '{cmd}' failed: {result.stderr}"
-                            )
-                    except FileNotFoundError:
-                        logging.warning(f"LibreOffice command '{cmd}' not found")
-                    except subprocess.TimeoutExpired:
-                        logging.warning(f"LibreOffice command '{cmd}' timed out")
-                    except Exception as e:
-                        logging.error(
-                            f"LibreOffice command '{cmd}' failed with exception: {e}"
-                        )
-
-                if not conversion_successful:
-                    raise RuntimeError(
-                        f"LibreOffice conversion failed for {doc_path.name}. "
-                        f"Please ensure LibreOffice is installed:\n"
-                        "- Windows: Download from https://www.libreoffice.org/download/download/\n"
-                        "- macOS: brew install --cask libreoffice\n"
-                        "- Ubuntu/Debian: sudo apt-get install libreoffice\n"
-                        "- CentOS/RHEL: sudo yum install libreoffice\n"
-                        "Alternatively, convert the document to PDF manually."
-                    )
 
                 # Find the generated PDF
                 pdf_files = list(temp_path.glob("*.pdf"))
                 if not pdf_files:
+                    # 添加详细的调试信息
+                    all_files = list(temp_path.glob("*"))
+                    logging.error(
+                        f"PDF conversion failed for {doc_path.name}:\n"
+                        f"  - Expected PDF in: {temp_path}\n"
+                        f"  - Files found: {[f.name for f in all_files]}\n"
+                        f"  - Source file exists: {doc_path.exists()}\n"
+                        f"  - Source file size: {doc_path.stat().st_size if doc_path.exists() else 'N/A'}"
+                    )
                     raise RuntimeError(
                         f"PDF conversion failed for {doc_path.name} - no PDF file generated. "
                         f"Please check LibreOffice installation or try manual conversion."
