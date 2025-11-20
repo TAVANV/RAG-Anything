@@ -51,16 +51,23 @@ class PoolableRAGAnything:
         self._lock_acquired = False
 
     async def acquire(self):
-        """Acquire lock for exclusive access"""
+        """
+        Acquire lock for exclusive access (无超时限制)
+
+        超时控制由池的排队机制管理,这里允许无限等待直到锁可用。
+        这样可以避免长时间处理任务(如30分钟文档解析)导致的超时问题。
+        """
         # 在异步环境中使用线程锁，通过 executor 避免阻塞
         loop = asyncio.get_event_loop()
-        # threading.Lock 在 Python 3.2+ 支持 timeout 参数
-        acquired = await loop.run_in_executor(None, lambda: self._lock.acquire(timeout=30.0))
+        # 移除 timeout 参数,允许无限等待锁可用
+        acquired = await loop.run_in_executor(None, lambda: self._lock.acquire(blocking=True))
         if acquired:
             self._lock_acquired = True
             self.state.update_usage()
+            return True
         else:
-            raise TimeoutError("Failed to acquire instance lock within 30 seconds")
+            # 理论上不会到达这里 (blocking=True 会一直等待)
+            raise RuntimeError("Failed to acquire instance lock")
 
     def release(self):
         """Release lock after usage - now safe across tasks"""
@@ -289,14 +296,16 @@ class PoolableLightRAG:
         # 在异步环境中使用线程锁，通过 executor 避免阻塞
         loop = asyncio.get_event_loop()
         # threading.Lock 在 Python 3.2+ 支持 timeout 参数
-        acquired = await loop.run_in_executor(None, lambda: self._lock.acquire(timeout=30.0))
+        # 从环境变量读取超时配置
+        timeout = float(os.getenv("POOL_ACQUIRE_TIMEOUT", "30"))
+        acquired = await loop.run_in_executor(None, lambda: self._lock.acquire(timeout=timeout))
         if acquired:
             self._lock_acquired = True
             self.state.update_usage()
             # Atomic increment
             self._reference_count += 1
         else:
-            raise TimeoutError("Failed to acquire LightRAG instance lock within 30 seconds")
+            raise TimeoutError(f"Failed to acquire LightRAG instance lock within {timeout} seconds")
 
     def release(self):
         """Release lock after usage - now safe across tasks"""
