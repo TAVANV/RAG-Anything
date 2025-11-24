@@ -7,12 +7,15 @@ import asyncio
 import hashlib
 import time
 import threading
+import logging
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 import pickle
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class InstanceState:
@@ -252,22 +255,28 @@ def parse_instance_key(key: str) -> str:
 async def warm_up_instance(poolable: PoolableRAGAnything) -> bool:
     """
     Warm up instance by initializing components
-    
+
     Args:
         poolable: Poolable instance
-        
+
     Returns:
         bool: True if warmed up successfully
     """
     try:
         # Initialize LightRAG
-        await poolable.instance._ensure_lightrag_initialized()
-        
+        result = await poolable.instance._ensure_lightrag_initialized()
+
+        # Check initialization result
+        if isinstance(result, dict) and not result.get("success", True):
+            logger.error(f"Failed to initialize LightRAG: {result.get('error', 'Unknown error')}")
+            return False
+
         # Perform health check
         is_healthy = await poolable.health_check()
-        
+
         return is_healthy
-    except Exception:
+    except Exception as e:
+        logger.error(f"Exception during warm up: {e}")
         return False
 
 
