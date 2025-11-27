@@ -24,6 +24,7 @@ def separate_content(
     """
     text_parts = []
     multimodal_items = []
+    skipped_empty_items = 0
 
     for item in content_list:
         content_type = item.get("type", "text")
@@ -35,6 +36,35 @@ def separate_content(
                 text_parts.append(text)
         else:
             # Multimodal content (image, table, equation, etc.)
+            # Skip items that have no actual content to avoid LLM hallucination
+            if content_type == "table":
+                # Table must have non-empty table_body
+                table_body = item.get("table_body", "")
+                if not table_body or not str(table_body).strip():
+                    logger.debug(
+                        f"Skipping empty table item (page_idx={item.get('page_idx', 'unknown')})"
+                    )
+                    skipped_empty_items += 1
+                    continue
+            elif content_type == "image":
+                # Image must have img_path
+                img_path = item.get("img_path", "")
+                if not img_path or not str(img_path).strip():
+                    logger.debug(
+                        f"Skipping empty image item (page_idx={item.get('page_idx', 'unknown')})"
+                    )
+                    skipped_empty_items += 1
+                    continue
+            elif content_type == "equation":
+                # Equation must have text or latex
+                eq_content = item.get("text", "") or item.get("latex", "")
+                if not eq_content or not str(eq_content).strip():
+                    logger.debug(
+                        f"Skipping empty equation item (page_idx={item.get('page_idx', 'unknown')})"
+                    )
+                    skipped_empty_items += 1
+                    continue
+
             multimodal_items.append(item)
 
     # Merge all text content
@@ -43,6 +73,8 @@ def separate_content(
     logger.info("Content separation complete:")
     logger.info(f"  - Text content length: {len(text_content)} characters")
     logger.info(f"  - Multimodal items count: {len(multimodal_items)}")
+    if skipped_empty_items > 0:
+        logger.info(f"  - Skipped empty multimodal items: {skipped_empty_items}")
 
     # Count multimodal types
     modal_types = {}

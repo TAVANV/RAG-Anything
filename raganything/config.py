@@ -27,7 +27,79 @@ class RAGAnythingConfig:
     """Default output directory for parsed content."""
 
     parser: str = field(default=get_env_value("PARSER", "mineru", str))
-    """Parser selection: 'mineru' or 'docling'."""
+    """Parser selection: 'mineru', 'docling', or 'tianshu'."""
+
+    # Tianshu Remote Parser Configuration
+    # ---
+    tianshu_url: str = field(
+        default=get_env_value("TIANSHU_URL", "http://localhost:8100", str)
+    )
+    """Tianshu service URL (used when parser='tianshu').
+
+    Examples:
+    - Local dev: http://localhost:8100
+    - Production: http://117.139.166.12:8100
+    - Docker internal: http://tianshu-api:8100
+    """
+
+    tianshu_poll_interval: float = field(
+        default=get_env_value("TIANSHU_POLL_INTERVAL", 2.0, float)
+    )
+    """Tianshu task polling interval in seconds.
+
+    Recommended values:
+    - Fast response: 0.5 - 1.0
+    - Normal: 2.0 - 5.0
+    - Long tasks: 10.0+
+    """
+
+    tianshu_timeout: int = field(
+        default=get_env_value("TIANSHU_TIMEOUT", 3600, int)
+    )
+    """Tianshu task timeout in seconds.
+
+    Recommended values:
+    - Small files: 300 (5 min)
+    - Medium files: 1800 (30 min)
+    - Large files: 3600+ (1 hour+)
+    """
+
+    tianshu_upload_images: bool = field(
+        default=get_env_value("TIANSHU_UPLOAD_IMAGES", False, bool)
+    )
+    """Whether to upload images to MinIO (requires Tianshu MinIO config).
+
+    Note:
+    - True: Images uploaded to MinIO, returned as URLs
+    - False: Images remain on Tianshu server
+    """
+
+    # Smart Parser Selection Configuration
+    # ---
+    auto_parser_selection: bool = field(
+        default=get_env_value("AUTO_PARSER_SELECTION", False, bool)
+    )
+    """Enable automatic parser selection based on file size.
+
+    When enabled:
+    - file < threshold → use local MinerU
+    - file >= threshold → use Tianshu
+
+    Priority:
+    - If parser='tianshu' is explicitly set, this option is ignored
+    - If parser='mineru' and this=true, selection is based on file size
+    """
+
+    auto_parser_threshold_mb: int = field(
+        default=get_env_value("AUTO_PARSER_THRESHOLD_MB", 10, int)
+    )
+    """File size threshold (MB) for automatic parser selection.
+
+    Recommended values:
+    - Strong local GPU: 20MB
+    - Weak local GPU: 5MB
+    - Balanced: 10MB
+    """
 
     display_content_stats: bool = field(
         default=get_env_value("DISPLAY_CONTENT_STATS", True, bool)

@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import (
     Dict,
@@ -1767,6 +1768,665 @@ class DoclingParser(Parser):
                 "Please ensure it is installed correctly."
             )
             return False
+
+
+class TianshuParser(Parser):
+    """
+    Tianshu remote document parsing service adapter.
+
+    Parses documents by calling Tianshu HTTP API, which uses MinerU internally.
+    Uses the /api/v1/tasks/{task_id}/data endpoint to retrieve complete content_list
+    with full metadata (page_idx, bbox, caption, etc.).
+
+    Attributes:
+        tianshu_url: Tianshu service URL
+        poll_interval: Polling interval in seconds
+        timeout: Task timeout in seconds
+        upload_images: Whether to upload images to MinIO
+        session: HTTP session for connection reuse
+    """
+
+    def __init__(
+        self,
+        tianshu_url: str = "http://localhost:8000",
+        poll_interval: float = 2.0,
+        timeout: int = 3600,
+        upload_images: bool = False,
+    ) -> None:
+        """
+        Initialize TianshuParser.
+
+        Args:
+            tianshu_url: Tianshu service URL (e.g., http://localhost:8000)
+            poll_interval: Polling interval for task status check (seconds)
+            timeout: Maximum time to wait for task completion (seconds)
+            upload_images: Whether to upload images to MinIO and return URLs
+        """
+        super().__init__()
+        self.tianshu_url = tianshu_url.rstrip("/")
+        self.poll_interval = poll_interval
+        self.timeout = timeout
+        self.upload_images = upload_images
+        self._session = None
+
+    @property
+    def session(self):
+        """Lazy initialization of HTTP session for connection reuse."""
+        if self._session is None:
+            try:
+                import requests
+                self._session = requests.Session()
+                # Set default timeout and retry strategy
+                from requests.adapters import HTTPAdapter
+                from urllib3.util.retry import Retry
+                retry_strategy = Retry(
+                    total=3,
+                    backoff_factor=1,
+                    status_forcelist=[500, 502, 503, 504],
+                )
+                adapter = HTTPAdapter(max_retries=retry_strategy)
+                self._session.mount("http://", adapter)
+                self._session.mount("https://", adapter)
+            except ImportError:
+                raise RuntimeError(
+                    "requests library is required for TianshuParser. "
+                    "Please install it using: pip install requests"
+                )
+        return self._session
+
+    def _submit_task(
+        self,
+        file_path: Path,
+        method: str = "auto",
+        lang: Optional[str] = None,
+        **kwargs,
+    ) -> str:
+        """
+        Submit a document parsing task to Tianshu service.
+
+        Args:
+            file_path: Path to the document file
+            method: Parsing method (auto, txt, ocr)
+            lang: Document language for OCR optimization
+            **kwargs: Additional options (backend, formula_enable, table_enable, priority)
+
+        Returns:
+            str: Task ID returned by Tianshu service
+
+        Raises:
+            RuntimeError: If task submission fails
+        """
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (file_path.name, f)}
+                data = {
+                    "lang": lang or "ch",
+                    "backend": kwargs.get("backend", "pipeline"),
+                    "method": method,
+                    "formula_enable": kwargs.get("formula", True),
+                    "table_enable": kwargs.get("table", True),
+                    "priority": kwargs.get("priority", 0),
+                }
+
+                response = self.session.post(
+                    f"{self.tianshu_url}/api/v1/tasks/submit",
+                    files=files,
+                    data=data,
+                    timeout=60,
+                )
+                response.raise_for_status()
+
+                result = response.json()
+                if not result.get("success"):
+                    raise RuntimeError(f"Task submission failed: {result}")
+
+                task_id = result.get("task_id")
+                if not task_id:
+                    raise RuntimeError("No task_id returned from Tianshu")
+
+                logging.info(f"[Tianshu] Task submitted: {task_id} for {file_path.name}")
+                return task_id
+
+        except Exception as e:
+            logging.error(f"[Tianshu] Failed to submit task: {e}")
+            raise RuntimeError(f"Tianshu task submission failed: {e}") from e
+
+    def _poll_task(self, task_id: str) -> str:
+        """
+        Poll task status until completion.
+
+        Args:
+            task_id: Task ID to poll
+
+        Returns:
+            str: Final task status ('completed')
+
+        Raises:
+            TimeoutError: If task exceeds timeout
+            RuntimeError: If task fails
+        """
+        start_time = time.time()
+        last_status = None
+
+        while True:
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed > self.timeout:
+                raise TimeoutError(
+                    f"[Tianshu] Task {task_id} timed out after {self.timeout}s"
+                )
+
+            try:
+                response = self.session.get(
+                    f"{self.tianshu_url}/api/v1/tasks/{task_id}",
+                    timeout=30,
+                )
+                response.raise_for_status()
+                result = response.json()
+
+                status = result.get("status")
+
+                # Log status change
+                if status != last_status:
+                    logging.info(
+                        f"[Tianshu] Task {task_id} status: {status} "
+                        f"(elapsed: {elapsed:.1f}s)"
+                    )
+                    last_status = status
+
+                if status == "completed":
+                    return status
+
+                elif status == "failed":
+                    error_msg = result.get("error_message", "Unknown error")
+                    raise RuntimeError(f"[Tianshu] Task failed: {error_msg}")
+
+                elif status in ["pending", "processing"]:
+                    time.sleep(self.poll_interval)
+
+                else:
+                    raise RuntimeError(f"[Tianshu] Unknown task status: {status}")
+
+            except Exception as e:
+                if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                    logging.warning(f"[Tianshu] Poll request timed out, retrying...")
+                    time.sleep(self.poll_interval)
+                else:
+                    raise
+
+    def _get_content_list(
+        self, task_id: str, output_dir: Optional[Path] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get content_list from Tianshu using the /data endpoint.
+
+        Args:
+            task_id: Task ID
+            output_dir: Optional output directory to save content_list.json
+
+        Returns:
+            List[Dict[str, Any]]: Content list in MinerU format
+
+        Raises:
+            RuntimeError: If content_list retrieval fails
+        """
+        try:
+            response = self.session.get(
+                f"{self.tianshu_url}/api/v1/tasks/{task_id}/data",
+                params={
+                    "include_fields": "content_list,images,md",
+                    "upload_images": self.upload_images,
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            if not result.get("success"):
+                raise RuntimeError(f"Failed to get content_list: {result}")
+
+            # Extract content_list from response
+            # Response format: {"data": {"content_list": {"content": [...], "file_name": "..."}, "images": [...]}}
+            data = result.get("data", {})
+            content_list_wrapper = data.get("content_list", {})
+
+            if isinstance(content_list_wrapper, dict):
+                content_list = content_list_wrapper.get("content", [])
+            else:
+                content_list = content_list_wrapper or []
+
+            if not content_list:
+                logging.warning(f"[Tianshu] Empty content_list returned for task {task_id}")
+
+            # Merge image URLs from images field into content_list (when upload_images=True)
+            logging.info(f"[Tianshu] upload_images={self.upload_images}")
+            if self.upload_images:
+                images_data = data.get("images", [])
+                logging.info(f"[Tianshu] images_data count: {len(images_data) if images_data else 0}")
+                content_list = self._merge_image_urls(content_list, images_data)
+            else:
+                logging.info("[Tianshu] upload_images is False, skipping URL merge")
+
+            logging.info(
+                f"[Tianshu] Retrieved content_list with {len(content_list)} items"
+            )
+
+            # Optionally save to output directory
+            if output_dir:
+                output_dir = Path(output_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                json_path = output_dir / f"{task_id}_content_list.json"
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(content_list, f, ensure_ascii=False, indent=2)
+                logging.info(f"[Tianshu] Saved content_list to: {json_path}")
+
+            return content_list
+
+        except Exception as e:
+            logging.error(f"[Tianshu] Failed to get content_list: {e}")
+            raise RuntimeError(f"Failed to get content_list from Tianshu: {e}") from e
+
+    def _merge_image_urls(
+        self, content_list: List[Dict[str, Any]], images_data: Any
+    ) -> List[Dict[str, Any]]:
+        """
+        Merge MinIO image URLs from images field into content_list items.
+
+        When upload_images=True, Tianshu uploads images to MinIO and returns URLs
+        in the images field. This method maps those URLs back to the corresponding
+        items in content_list using the path field as the key.
+
+        Args:
+            content_list: Content list with img_path fields (relative paths)
+            images_data: Images data from Tianshu response. Can be:
+                - A dict with "content" key containing list of image info
+                - A list of image info dicts, each containing:
+                    - name: Image filename
+                    - path: Relative path (matches img_path in content_list)
+                    - url: MinIO URL for the image
+
+        Returns:
+            Updated content_list with url fields added to image items
+        """
+        if not images_data:
+            logging.info("[Tianshu] No images_data provided")
+            return content_list
+
+        # Handle different response formats
+        # Format 1: {"count": N, "list": [...]} (Tianshu format)
+        # Format 2: {"content": [...], "file_name": "..."} (wrapper format)
+        # Format 3: [...] (direct list)
+        if isinstance(images_data, dict):
+            # Try "list" key first (Tianshu format)
+            if "list" in images_data:
+                images_list = images_data.get("list", [])
+                logging.info(f"[Tianshu] images_data is dict, extracted {len(images_list)} items from 'list'")
+            else:
+                images_list = images_data.get("content", [])
+                logging.info(f"[Tianshu] images_data is dict, extracted {len(images_list)} items from 'content'")
+        elif isinstance(images_data, list):
+            images_list = images_data
+            logging.info(f"[Tianshu] images_data is list with {len(images_list)} items")
+        else:
+            logging.warning(f"[Tianshu] Unexpected images_data type: {type(images_data)}")
+            return content_list
+
+        if not images_list:
+            logging.info("[Tianshu] images_list is empty")
+            return content_list
+
+        # Log first item to debug format
+        if images_list:
+            first_item = images_list[0]
+            logging.info(f"[Tianshu] First image item type: {type(first_item)}, value: {first_item}")
+
+        # Build path -> url mapping
+        # Expected format: [{"name": "xxx.jpg", "path": "images/xxx.jpg", "url": "http://..."}]
+        path_to_url = {}
+        for img in images_list:
+            if isinstance(img, dict):
+                path = img.get("path")
+                url = img.get("url")
+                if path and url:
+                    path_to_url[path] = url
+            else:
+                logging.warning(f"[Tianshu] Skipping non-dict image item: {type(img)}")
+
+        if not path_to_url:
+            logging.warning("[Tianshu] No valid image URLs found in images data")
+            return content_list
+
+        logging.info(f"[Tianshu] Built path->url mapping for {len(path_to_url)} images")
+
+        # Merge URLs into content_list
+        merged_count = 0
+        for item in content_list:
+            # Check for image items (type == "image" or has img_path)
+            if item.get("type") == "image" or "img_path" in item:
+                img_path = item.get("img_path")
+                if img_path and img_path in path_to_url:
+                    item["url"] = path_to_url[img_path]
+                    merged_count += 1
+                    logging.debug(f"[Tianshu] Merged URL for: {img_path}")
+
+        logging.info(f"[Tianshu] Merged {merged_count} image URLs into content_list")
+
+        return content_list
+
+    def _download_images(
+        self, task_id: str, content_list: List[Dict[str, Any]], output_dir: Path
+    ) -> List[Dict[str, Any]]:
+        """
+        Download images from Tianshu server and update img_path in content_list.
+
+        Args:
+            task_id: Tianshu task ID
+            content_list: Content list with relative image paths
+            output_dir: Local output directory
+
+        Returns:
+            Updated content_list with absolute local image paths
+        """
+        images_dir = output_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded_count = 0
+        failed_count = 0
+
+        for item in content_list:
+            # Check for image items
+            if item.get("type") == "image" or "img_path" in item:
+                img_path = item.get("img_path", "")
+                if not img_path:
+                    continue
+
+                # Skip if already absolute path or URL
+                if img_path.startswith("/") or img_path.startswith("http"):
+                    continue
+
+                # Extract image filename
+                img_filename = Path(img_path).name
+
+                try:
+                    # Download image from Tianshu
+                    response = self.session.get(
+                        f"{self.tianshu_url}/api/v1/tasks/{task_id}/images/{img_filename}",
+                        timeout=30,
+                    )
+
+                    if response.status_code == 200:
+                        # Save image locally
+                        local_img_path = images_dir / img_filename
+                        with open(local_img_path, "wb") as f:
+                            f.write(response.content)
+
+                        # Update path in content_list to absolute path
+                        item["img_path"] = str(local_img_path.absolute())
+                        downloaded_count += 1
+                        logging.debug(f"[Tianshu] Downloaded image: {img_filename}")
+                    else:
+                        logging.warning(
+                            f"[Tianshu] Failed to download image {img_filename}: "
+                            f"HTTP {response.status_code}"
+                        )
+                        failed_count += 1
+
+                except Exception as e:
+                    logging.warning(f"[Tianshu] Error downloading image {img_filename}: {e}")
+                    failed_count += 1
+
+        if downloaded_count > 0 or failed_count > 0:
+            logging.info(
+                f"[Tianshu] Image download complete: "
+                f"{downloaded_count} succeeded, {failed_count} failed"
+            )
+
+        return content_list
+
+    # Text file formats that can be read directly without Tianshu parsing
+    TEXT_FORMATS = {".md", ".txt", ".markdown", ".rst", ".text"}
+
+    def parse_document(
+        self,
+        file_path: Union[str, Path],
+        method: str = "auto",
+        output_dir: Optional[str] = None,
+        lang: Optional[str] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse document using Tianshu remote service.
+
+        For text-based files (.md, .txt, etc.), reads content directly without
+        calling Tianshu, as these files don't need parsing/OCR.
+
+        Args:
+            file_path: Path to the document file
+            method: Parsing method (auto, txt, ocr)
+            output_dir: Output directory path
+            lang: Document language for OCR optimization
+            **kwargs: Additional parameters (backend, formula, table, priority)
+
+        Returns:
+            List[Dict[str, Any]]: List of content blocks in MinerU format
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File does not exist: {file_path}")
+
+        # For text-based files, read directly without Tianshu
+        ext = file_path.suffix.lower()
+        if ext in self.TEXT_FORMATS:
+            logging.info(f"[Tianshu] Text file detected, reading directly: {file_path.name}")
+            return self._parse_text_file(file_path)
+
+        logging.info(f"[Tianshu] Parsing document: {file_path.name}")
+
+        # Step 1: Submit task
+        task_id = self._submit_task(file_path, method, lang, **kwargs)
+
+        # Step 2: Poll until completion
+        self._poll_task(task_id)
+
+        # Step 3: Get content_list
+        output_path = Path(output_dir) if output_dir else Path("output")
+        content_list = self._get_content_list(task_id, output_path)
+
+        # Step 4: Download images from Tianshu server (if not using MinIO upload)
+        if not self.upload_images and output_path:
+            content_list = self._download_images(task_id, content_list, output_path)
+
+        logging.info(
+            f"[Tianshu] Successfully parsed {file_path.name}: "
+            f"{len(content_list)} content blocks"
+        )
+
+        return content_list
+
+    def _parse_text_file(self, file_path: Path) -> List[Dict[str, Any]]:
+        """
+        Parse text-based file (Markdown, TXT, etc.) directly without Tianshu.
+
+        These files are already in readable format and don't need OCR or parsing.
+        Simply reads the content and converts to content_list format.
+
+        Args:
+            file_path: Path to the text file
+
+        Returns:
+            List[Dict[str, Any]]: Content list with text blocks
+        """
+        try:
+            # Try common encodings
+            content = None
+            for encoding in ["utf-8", "gbk", "gb2312", "latin-1"]:
+                try:
+                    with open(file_path, "r", encoding=encoding) as f:
+                        content = f.read()
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            if content is None:
+                raise ValueError(f"Failed to decode file with supported encodings: {file_path}")
+
+            if not content.strip():
+                logging.warning(f"[Tianshu] Text file is empty: {file_path.name}")
+                return []
+
+            # Build content_list from text content
+            # Split by paragraphs (double newlines) to create separate text blocks
+            paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+
+            content_list = []
+            for i, paragraph in enumerate(paragraphs):
+                content_list.append({
+                    "type": "text",
+                    "text": paragraph,
+                    "page_idx": 0,  # Text files don't have pages
+                })
+
+            logging.info(
+                f"[Tianshu] Successfully read text file {file_path.name}: "
+                f"{len(content_list)} text blocks, {len(content)} characters"
+            )
+
+            return content_list
+
+        except Exception as e:
+            logging.error(f"[Tianshu] Failed to read text file {file_path}: {e}")
+            raise
+
+    def parse_pdf(
+        self,
+        pdf_path: Union[str, Path],
+        output_dir: Optional[str] = None,
+        method: str = "auto",
+        lang: Optional[str] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse PDF document using Tianshu.
+
+        Args:
+            pdf_path: Path to the PDF file
+            output_dir: Output directory path
+            method: Parsing method (auto, txt, ocr)
+            lang: Document language for OCR optimization
+            **kwargs: Additional parameters for Tianshu
+
+        Returns:
+            List[Dict[str, Any]]: List of content blocks
+        """
+        return self.parse_document(pdf_path, method, output_dir, lang, **kwargs)
+
+    def parse_image(
+        self,
+        image_path: Union[str, Path],
+        output_dir: Optional[str] = None,
+        lang: Optional[str] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse image document using Tianshu.
+
+        Args:
+            image_path: Path to the image file
+            output_dir: Output directory path
+            lang: Document language for OCR optimization
+            **kwargs: Additional parameters for Tianshu
+
+        Returns:
+            List[Dict[str, Any]]: List of content blocks
+        """
+        return self.parse_document(image_path, "ocr", output_dir, lang, **kwargs)
+
+    def parse_office_doc(
+        self,
+        doc_path: Union[str, Path],
+        output_dir: Optional[str] = None,
+        lang: Optional[str] = None,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parse Office document using Tianshu.
+
+        This method first converts the Office document to PDF locally using LibreOffice,
+        then sends the PDF to Tianshu for parsing. This approach ensures:
+        1. Complete content_list with full metadata (page_idx, bbox, etc.)
+        2. Consistency with local MinerU parsing results
+        3. No information loss from MarkItDown conversion
+
+        Supported formats: .doc, .docx, .ppt, .pptx, .xls, .xlsx
+
+        Args:
+            doc_path: Path to the Office document file
+            output_dir: Output directory path
+            lang: Document language for OCR optimization
+            **kwargs: Additional parameters for Tianshu
+
+        Returns:
+            List[Dict[str, Any]]: List of content blocks
+
+        Raises:
+            ValueError: If the file format is not supported
+            RuntimeError: If LibreOffice conversion fails
+        """
+        doc_path = Path(doc_path)
+        if doc_path.suffix.lower() not in self.OFFICE_FORMATS:
+            raise ValueError(
+                f"Unsupported office format: {doc_path.suffix}. "
+                f"Supported formats: {', '.join(self.OFFICE_FORMATS)}"
+            )
+
+        logging.info(
+            f"[Tianshu] Converting Office document to PDF locally: {doc_path.name}"
+        )
+
+        try:
+            # Convert Office document to PDF using base class method (requires LibreOffice)
+            pdf_path = self.convert_office_to_pdf(doc_path, output_dir)
+            logging.info(f"[Tianshu] Converted to PDF: {pdf_path}")
+
+            # Parse the converted PDF using Tianshu
+            return self.parse_document(pdf_path, "auto", output_dir, lang, **kwargs)
+
+        except Exception as e:
+            logging.error(f"[Tianshu] Failed to process Office document: {e}")
+            raise
+
+    def check_installation(self) -> bool:
+        """
+        Check if Tianshu service is available.
+
+        Returns:
+            bool: True if Tianshu service is healthy, False otherwise
+        """
+        try:
+            response = self.session.get(
+                f"{self.tianshu_url}/api/v1/health",
+                timeout=10,
+            )
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("status") == "healthy":
+                    logging.info(f"[Tianshu] Service is healthy at {self.tianshu_url}")
+                    return True
+            logging.warning(f"[Tianshu] Service unhealthy: {response.text}")
+            return False
+        except Exception as e:
+            logging.warning(f"[Tianshu] Service unavailable at {self.tianshu_url}: {e}")
+            return False
+
+    def close(self) -> None:
+        """Close the HTTP session."""
+        if self._session:
+            self._session.close()
+            self._session = None
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        self.close()
 
 
 def main():

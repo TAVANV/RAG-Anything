@@ -10,12 +10,14 @@ Includes:
 """
 
 import re
+import os
 import json
 import time
 import base64
 from typing import Dict, Any, Tuple, List
 from pathlib import Path
 from dataclasses import dataclass
+from urllib.parse import urlparse, urlunparse
 
 from lightrag.utils import (
     logger,
@@ -797,14 +799,88 @@ class ImageModalProcessor(BaseModalProcessor):
         """
         super().__init__(lightrag, modal_caption_func, context_extractor)
 
-    def _encode_image_to_base64(self, image_path: str) -> str:
-        """Encode image to base64"""
+    def _replace_image_url_base(self, image_url: str) -> str:
+        """Replace image URL base with configured TIANSHU_IMAGE_BASE_URL.
+
+        Converts internal MinIO URLs (e.g., http://minio:9000/path) to
+        externally accessible URLs (e.g., http://localhost:9200/path).
+
+        Args:
+            image_url: Original image URL from Tianshu
+
+        Returns:
+            URL with replaced base, or original URL if no replacement configured
+        """
+        base_url = os.environ.get("TIANSHU_IMAGE_BASE_URL", "").strip()
+        if not base_url or not image_url:
+            return image_url
+
         try:
-            with open(image_path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-            return encoded_string
+            # Parse original URL
+            parsed = urlparse(image_url)
+            # Parse configured base URL
+            base_parsed = urlparse(base_url)
+
+            # Replace scheme and netloc (host:port), keep path
+            new_url = urlunparse((
+                base_parsed.scheme or parsed.scheme,
+                base_parsed.netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+            logger.debug(f"Replaced image URL: {image_url} -> {new_url}")
+            return new_url
         except Exception as e:
-            logger.error(f"Failed to encode image {image_path}: {e}")
+            logger.warning(f"Failed to replace image URL base: {e}, using original URL")
+            return image_url
+
+    def _encode_image_to_base64(self, image_source: str) -> str:
+        """Encode image to base64 from local file or URL
+
+        Args:
+            image_source: Local file path or HTTP/HTTPS URL
+
+        Returns:
+            Base64 encoded string of the image
+        """
+        try:
+            # Check if source is a URL
+            if image_source.startswith(("http://", "https://")):
+                return self._encode_image_from_url(image_source)
+            else:
+                # Local file path
+                with open(image_source, "rb") as image_file:
+                    encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+                return encoded_string
+        except Exception as e:
+            logger.error(f"Failed to encode image {image_source}: {e}")
+            return ""
+
+    def _encode_image_from_url(self, image_url: str) -> str:
+        """Download image from URL and encode to base64
+
+        Args:
+            image_url: HTTP/HTTPS URL of the image
+
+        Returns:
+            Base64 encoded string of the image
+        """
+        try:
+            import requests
+
+            response = requests.get(image_url, timeout=30)
+            response.raise_for_status()
+
+            encoded_string = base64.b64encode(response.content).decode("utf-8")
+            logger.debug(f"Successfully downloaded and encoded image from URL: {image_url}")
+            return encoded_string
+        except ImportError:
+            logger.error("requests library is required for URL image fetching. Please install: pip install requests")
+            return ""
+        except Exception as e:
+            logger.error(f"Failed to download image from URL {image_url}: {e}")
             return ""
 
     async def generate_description_only(
@@ -837,6 +913,8 @@ class ImageModalProcessor(BaseModalProcessor):
             else:
                 content_data = modal_content
 
+            # Priority: url (MinIO) > img_path (local file)
+            image_url = content_data.get("url")
             image_path = content_data.get("img_path")
             captions = content_data.get(
                 "image_caption", content_data.get("img_caption", [])
@@ -845,16 +923,26 @@ class ImageModalProcessor(BaseModalProcessor):
                 "image_footnote", content_data.get("img_footnote", [])
             )
 
-            # Validate image path
-            if not image_path:
-                raise ValueError(
-                    f"No image path provided in modal_content: {modal_content}"
-                )
+            # Determine image source: prefer URL if available, fallback to local path
+            image_source = None
+            if image_url and image_url.startswith(("http://", "https://")):
+                # Replace URL base with configured TIANSHU_IMAGE_BASE_URL
+                image_source = self._replace_image_url_base(image_url)
+                logger.debug(f"Using image URL: {image_source}")
+            elif image_path:
+                # Check if local file exists
+                image_path_obj = Path(image_path)
+                if image_path_obj.exists():
+                    image_source = image_path
+                    logger.debug(f"Using local image path: {image_path}")
+                else:
+                    logger.warning(f"Local image file not found: {image_path}")
 
-            # Convert to Path object and check if it exists
-            image_path_obj = Path(image_path)
-            if not image_path_obj.exists():
-                raise FileNotFoundError(f"Image file not found: {image_path}")
+            # Validate image source
+            if not image_source:
+                raise ValueError(
+                    f"No valid image source (url or img_path) in modal_content: {modal_content}"
+                )
 
             # Extract context for current item
             context = ""
@@ -870,7 +958,7 @@ class ImageModalProcessor(BaseModalProcessor):
                     entity_name=entity_name
                     if entity_name
                     else "unique descriptive name for this image",
-                    image_path=image_path,
+                    image_path=image_source,
                     captions=captions if captions else "None",
                     footnotes=footnotes if footnotes else "None",
                 )
@@ -879,15 +967,15 @@ class ImageModalProcessor(BaseModalProcessor):
                     entity_name=entity_name
                     if entity_name
                     else "unique descriptive name for this image",
-                    image_path=image_path,
+                    image_path=image_source,
                     captions=captions if captions else "None",
                     footnotes=footnotes if footnotes else "None",
                 )
 
-            # Encode image to base64
-            image_base64 = self._encode_image_to_base64(image_path)
+            # Encode image to base64 (supports both URL and local path)
+            image_base64 = self._encode_image_to_base64(image_source)
             if not image_base64:
-                raise RuntimeError(f"Failed to encode image to base64: {image_path}")
+                raise RuntimeError(f"Failed to encode image to base64: {image_source}")
 
             # Call vision model with encoded image
             response = await self.modal_caption_func(

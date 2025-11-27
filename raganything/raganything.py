@@ -32,7 +32,7 @@ from raganything.query import QueryMixin
 from raganything.processor import ProcessorMixin
 from raganything.batch import BatchMixin
 from raganything.utils import get_processor_supports
-from raganything.parser import MineruParser, DoclingParser
+from raganything.parser import MineruParser, DoclingParser, TianshuParser
 
 # Import specialized processors
 from raganything.modalprocessors import (
@@ -108,9 +108,23 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
         self.logger = logger
 
         # Set up document parser
-        self.doc_parser = (
-            DoclingParser() if self.config.parser == "docling" else MineruParser()
-        )
+        if self.config.parser == "tianshu":
+            self.doc_parser = TianshuParser(
+                tianshu_url=self.config.tianshu_url,
+                poll_interval=self.config.tianshu_poll_interval,
+                timeout=self.config.tianshu_timeout,
+                upload_images=self.config.tianshu_upload_images,
+            )
+            self.logger.info(
+                f"Using TianshuParser at {self.config.tianshu_url} "
+                f"(upload_images={self.config.tianshu_upload_images})"
+            )
+        elif self.config.parser == "docling":
+            self.doc_parser = DoclingParser()
+            self.logger.info("Using DoclingParser")
+        else:
+            self.doc_parser = MineruParser()
+            self.logger.info("Using MineruParser")
 
         # Register close method for cleanup
         atexit.register(self.close)
@@ -535,8 +549,18 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
 
     def get_processor_info(self) -> Dict[str, Any]:
         """Get processor information"""
+        # Check current parser status
+        parser_type = self.config.parser
+        parser_available = self.doc_parser.check_installation()
+
         base_info = {
-            "mineru_installed": MineruParser.check_installation(MineruParser()),
+            "parser": {
+                "type": parser_type,
+                "available": parser_available,
+                "class": self.doc_parser.__class__.__name__,
+            },
+            "mineru_installed": MineruParser().check_installation(),
+            "docling_installed": DoclingParser().check_installation(),
             "config": self.get_config_info(),
             "models": {
                 "llm_model": "External function"
@@ -550,6 +574,11 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 else "Not provided",
             },
         }
+
+        # Add Tianshu-specific info if using Tianshu
+        if parser_type == "tianshu":
+            base_info["parser"]["tianshu_url"] = self.config.tianshu_url
+            base_info["tianshu_service_healthy"] = parser_available
 
         if not self.modal_processors:
             base_info["status"] = "Not initialized"

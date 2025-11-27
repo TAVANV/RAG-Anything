@@ -317,9 +317,9 @@ class ProcessorMixin:
         ext = file_path.suffix.lower()
 
         try:
-            doc_parser = (
-                DoclingParser() if self.config.parser == "docling" else MineruParser()
-            )
+            # 使用 __post_init__ 中初始化的 self.doc_parser
+            # 它可能是 MineruParser, DoclingParser, 或 TianshuParser
+            doc_parser = self.doc_parser
 
             # Log parser and method information
             self.logger.info(
