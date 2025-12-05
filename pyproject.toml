@@ -21,10 +21,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "huggingface_hub",
     "lightrag-hku==1.4.9.4",
-    "mineru[core]",
     "tqdm",
+    "httpx>=0.27.0",  # Tianshu HTTP client
 ]
 
 [project.optional-dependencies]

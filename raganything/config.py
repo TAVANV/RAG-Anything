@@ -26,8 +26,8 @@ class RAGAnythingConfig:
     parser_output_dir: str = field(default=get_env_value("OUTPUT_DIR", "./output", str))
     """Default output directory for parsed content."""
 
-    parser: str = field(default=get_env_value("PARSER", "mineru", str))
-    """Parser selection: 'mineru', 'docling', or 'tianshu'."""
+    parser: str = field(default=get_env_value("PARSER", "tianshu", str))
+    """Parser selection: 'tianshu' (only supported option)."""
 
     # Tianshu Remote Parser Configuration
     # ---
@@ -72,33 +72,6 @@ class RAGAnythingConfig:
     Note:
     - True: Images uploaded to MinIO, returned as URLs
     - False: Images remain on Tianshu server
-    """
-
-    # Smart Parser Selection Configuration
-    # ---
-    auto_parser_selection: bool = field(
-        default=get_env_value("AUTO_PARSER_SELECTION", False, bool)
-    )
-    """Enable automatic parser selection based on file size.
-
-    When enabled:
-    - file < threshold → use local MinerU
-    - file >= threshold → use Tianshu
-
-    Priority:
-    - If parser='tianshu' is explicitly set, this option is ignored
-    - If parser='mineru' and this=true, selection is based on file size
-    """
-
-    auto_parser_threshold_mb: int = field(
-        default=get_env_value("AUTO_PARSER_THRESHOLD_MB", 10, int)
-    )
-    """File size threshold (MB) for automatic parser selection.
-
-    Recommended values:
-    - Strong local GPU: 20MB
-    - Weak local GPU: 5MB
-    - Balanced: 10MB
     """
 
     display_content_stats: bool = field(

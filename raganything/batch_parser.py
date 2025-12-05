@@ -15,7 +15,7 @@ import time
 
 from tqdm import tqdm
 
-from .parser import MineruParser, DoclingParser
+from .parser import TianshuParser
 
 
 @dataclass
@@ -58,7 +58,7 @@ class BatchParser:
 
     def __init__(
         self,
-        parser_type: str = "mineru",
+        tianshu_url: str = "http://localhost:8100",
         max_workers: int = 4,
         show_progress: bool = True,
         timeout_per_file: int = 300,
@@ -68,32 +68,26 @@ class BatchParser:
         Initialize batch parser
 
         Args:
-            parser_type: Type of parser to use ("mineru" or "docling")
+            tianshu_url: URL of the Tianshu parsing service
             max_workers: Maximum number of parallel workers
             show_progress: Whether to show progress bars
             timeout_per_file: Timeout in seconds for each file
             skip_installation_check: Skip parser installation check (useful for testing)
         """
-        self.parser_type = parser_type
+        self.tianshu_url = tianshu_url
         self.max_workers = max_workers
         self.show_progress = show_progress
         self.timeout_per_file = timeout_per_file
         self.logger = logging.getLogger(__name__)
 
-        # Initialize parser
-        if parser_type == "mineru":
-            self.parser = MineruParser()
-        elif parser_type == "docling":
-            self.parser = DoclingParser()
-        else:
-            raise ValueError(f"Unsupported parser type: {parser_type}")
+        # Initialize TianshuParser
+        self.parser = TianshuParser(tianshu_url=tianshu_url)
 
         # Check parser installation (optional)
         if not skip_installation_check:
             if not self.parser.check_installation():
                 self.logger.warning(
-                    f"{parser_type.title()} parser installation check failed. "
-                    f"This may be due to package conflicts. "
+                    f"Tianshu service at {tianshu_url} is not available. "
                     f"Use skip_installation_check=True to bypass this check."
                 )
                 # Don't raise an error, just warn - the parser might still work
@@ -253,7 +247,7 @@ class BatchParser:
         if self.show_progress:
             pbar = tqdm(
                 total=len(supported_files),
-                desc=f"Processing files ({self.parser_type})",
+                desc="Processing files (tianshu)",
                 unit="file",
             )
 
@@ -356,14 +350,13 @@ def main():
     """Command-line interface for batch parsing"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Batch document parsing")
+    parser = argparse.ArgumentParser(description="Batch document parsing using Tianshu")
     parser.add_argument("paths", nargs="+", help="File paths or directories to process")
     parser.add_argument("--output", "-o", required=True, help="Output directory")
     parser.add_argument(
-        "--parser",
-        choices=["mineru", "docling"],
-        default="mineru",
-        help="Parser to use",
+        "--tianshu-url",
+        default="http://localhost:8100",
+        help="Tianshu service URL",
     )
     parser.add_argument(
         "--method",
@@ -398,7 +391,7 @@ def main():
     try:
         # Create batch parser
         batch_parser = BatchParser(
-            parser_type=args.parser,
+            tianshu_url=args.tianshu_url,
             max_workers=args.workers,
             show_progress=not args.no_progress,
             timeout_per_file=args.timeout,

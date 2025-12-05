@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Example script demonstrating the integration of MinerU parser with RAGAnything
+Example script demonstrating the integration of Tianshu parser with RAGAnything
 
 This example shows how to:
-1. Process documents with RAGAnything using MinerU parser
+1. Process documents with RAGAnything using Tianshu remote parser
 2. Perform pure text queries using aquery() method
 3. Perform multimodal queries with specific multimodal content using aquery_with_multimodal() method
 4. Handle different types of multimodal content (tables, equations) in queries

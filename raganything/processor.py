@@ -12,7 +12,7 @@ from typing import Dict, List, Any, Tuple, Optional
 from pathlib import Path
 
 from raganything.base import DocStatus
-from raganything.parser import MineruParser, DoclingParser, MineruExecutionError
+from raganything.parser import TianshuParser
 from raganything.utils import (
     separate_content,
     insert_text_content,
@@ -317,8 +317,7 @@ class ProcessorMixin:
         ext = file_path.suffix.lower()
 
         try:
-            # 使用 __post_init__ 中初始化的 self.doc_parser
-            # 它可能是 MineruParser, DoclingParser, 或 TianshuParser
+            # 使用 __post_init__ 中初始化的 self.doc_parser (TianshuParser)
             doc_parser = self.doc_parser
 
             # Log parser and method information
@@ -355,12 +354,9 @@ class ProcessorMixin:
                         **kwargs,
                     )
                 else:
-                    # Fallback to MinerU for image parsing if current parser doesn't support it
-                    self.logger.warning(
-                        f"{self.config.parser} parser doesn't support image parsing, falling back to MinerU"
-                    )
-                    content_list = MineruParser().parse_image(
-                        image_path=file_path, output_dir=output_dir, **kwargs
+                    # Parser doesn't support image parsing
+                    raise ValueError(
+                        f"Parser doesn't support image parsing for file: {file_path}"
                     )
             elif ext in [
                 ".doc",
@@ -395,9 +391,6 @@ class ProcessorMixin:
                     **kwargs,
                 )
 
-        except MineruExecutionError as e:
-            self.logger.error(f"Mineru command failed: {e}")
-            raise
         except Exception as e:
             self.logger.error(
                 f"Error during parsing with {self.config.parser} parser: {str(e)}"
@@ -1667,23 +1660,6 @@ class ProcessorMixin:
                 content_list, content_based_doc_id = await self.parse_document(
                     file_path, output_dir, parse_method, display_stats, **kwargs
                 )
-            except MineruExecutionError as e:
-                error_message = e.error_msg
-                if isinstance(e.error_msg, list):
-                    error_message = "\n".join(e.error_msg)
-                await self.lightrag.doc_status.upsert(
-                    {
-                        doc_pre_id: {
-                            **current_doc_status,
-                            "status": DocStatus.FAILED,
-                            "error_msg": error_message,
-                        }
-                    }
-                )
-                self.logger.info(
-                    f"Error processing document {file_path}: MineruExecutionError"
-                )
-                return False
             except Exception as e:
                 await self.lightrag.doc_status.upsert(
                     {

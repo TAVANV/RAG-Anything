@@ -122,7 +122,7 @@ def demonstrate_basic_batch_processing():
 
         # Create batch parser
         batch_parser = BatchParser(
-            parser_type="mineru",
+            tianshu_url="http://localhost:8100",
             max_workers=3,
             show_progress=True,
             timeout_per_file=60,
@@ -130,7 +130,7 @@ def demonstrate_basic_batch_processing():
         )
 
         print("\nBatch parser configured:")
-        print("  - Parser type: mineru")
+        print("  - Parser: tianshu")
         print("  - Max workers: 3")
         print("  - Progress tracking: enabled")
         print("  - Timeout per file: 60 seconds")
@@ -199,7 +199,7 @@ async def demonstrate_async_batch_processing():
 
         # Create batch parser
         batch_parser = BatchParser(
-            parser_type="mineru",
+            tianshu_url="http://localhost:8100",
             max_workers=2,
             show_progress=True,
             skip_installation_check=True,
@@ -361,7 +361,7 @@ def demonstrate_directory_processing():
 
         # Create batch parser
         batch_parser = BatchParser(
-            parser_type="mineru",
+            tianshu_url="http://localhost:8100",
             max_workers=2,
             show_progress=True,
             skip_installation_check=True,
