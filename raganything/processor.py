@@ -1485,7 +1485,36 @@ class ProcessorMixin:
         # Step 2: Separate text and multimodal content
         text_content, multimodal_items = separate_content(content_list)
 
-        # Step 2.5: Set content source for context extraction in multimodal processing
+        # Step 2.5: Filter low-quality text chunks (if enabled)
+        from raganything.utils import filter_low_quality_text_chunks
+
+        # Get filter configuration from RAGAnything config (if available)
+        enable_filter = getattr(self.config, 'enable_chunk_filter', True)
+        min_chars = getattr(self.config, 'min_chunk_chars', 30)
+        min_tokens = getattr(self.config, 'min_chunk_tokens', 10)
+
+        if text_content.strip() and enable_filter:
+            self.logger.info("Applying chunk quality filter...")
+            text_content, filter_stats = filter_low_quality_text_chunks(
+                text_content=text_content,
+                split_by_character=split_by_character or "\n\n",
+                min_chars=min_chars,
+                min_tokens=min_tokens,
+                enable_filter=enable_filter,
+            )
+
+            # Log filter results
+            if filter_stats["filtered_chunks"] > 0:
+                self.logger.info(
+                    f"Chunk filter applied: "
+                    f"kept {filter_stats['kept_chunks']}/{filter_stats['original_chunks']} chunks "
+                    f"(filtered {filter_stats['filter_rate']:.1%})"
+                )
+        else:
+            if not enable_filter:
+                self.logger.info("Chunk quality filter is disabled")
+
+        # Step 2.6: Set content source for context extraction in multimodal processing
         if hasattr(self, "set_content_source_for_context") and multimodal_items:
             self.logger.info(
                 "Setting content source for context-aware multimodal processing..."

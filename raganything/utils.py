@@ -88,6 +88,128 @@ def separate_content(
     return text_content, multimodal_items
 
 
+def filter_low_quality_text_chunks(
+    text_content: str,
+    split_by_character: str = "\n\n",
+    min_chars: int = 30,
+    min_tokens: int = 10,
+    enable_filter: bool = True,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Filter out low-quality text chunks before inserting into LightRAG
+
+    过滤掉低质量的文本块，避免向量空间被垃圾数据污染。
+
+    Args:
+        text_content: 原始文本内容
+        split_by_character: 分段字符 (用于预分割，匹配 LightRAG 的分块逻辑)
+        min_chars: 最小字符数阈值 (default: 30)
+        min_tokens: 最小 token 数阈值 (default: 10)
+        enable_filter: 是否启用过滤 (default: True)
+
+    Returns:
+        (filtered_text, stats): 过滤后的文本和过滤统计信息
+
+    Example:
+        >>> text = "Hello world\n\n\n\n19\n\n25\n\nThis is a good paragraph with enough content."
+        >>> filtered, stats = filter_low_quality_text_chunks(text, min_chars=20)
+        >>> print(stats)
+        {'original_chunks': 3, 'filtered_chunks': 1, 'kept_chunks': 2, 'filter_rate': 0.33}
+    """
+    if not enable_filter:
+        logger.info("Chunk quality filter is disabled, skipping filtering")
+        return text_content, {
+            "original_chunks": 0,
+            "filtered_chunks": 0,
+            "kept_chunks": 0,
+            "filter_rate": 0.0,
+        }
+
+    if not text_content or not text_content.strip():
+        logger.warning("Empty text content, nothing to filter")
+        return text_content, {
+            "original_chunks": 0,
+            "filtered_chunks": 0,
+            "kept_chunks": 0,
+            "filter_rate": 0.0,
+        }
+
+    # 按照 split_by_character 预分割（模拟 LightRAG 的分块逻辑）
+    # 注意：这只是粗略过滤，LightRAG 内部还会进一步按 token 分块
+    preliminary_chunks = text_content.split(split_by_character)
+
+    original_count = len(preliminary_chunks)
+    kept_chunks = []
+    filtered_count = 0
+
+    logger.info(
+        f"Starting chunk quality filter: "
+        f"min_chars={min_chars}, min_tokens={min_tokens}, "
+        f"preliminary_chunks={original_count}"
+    )
+
+    for chunk in preliminary_chunks:
+        chunk = chunk.strip()
+
+        if not chunk:
+            filtered_count += 1
+            continue
+
+        # 统计字符数
+        char_count = len(chunk)
+
+        # 粗略估计 token 数
+        # 中文：1 字符 ≈ 1 token
+        # 英文：1 单词 ≈ 1 token，按空格分割估算
+        # 混合文本：按字符数估算
+        if any('\u4e00' <= c <= '\u9fff' for c in chunk):
+            # 包含中文，按字符数估算
+            estimated_tokens = char_count
+        else:
+            # 纯英文，按单词数估算
+            estimated_tokens = len(chunk.split())
+
+        # 过滤逻辑：字符数或 token 数任一低于阈值则过滤
+        if char_count < min_chars or estimated_tokens < min_tokens:
+            logger.debug(
+                f"Filtered low-quality chunk: "
+                f"chars={char_count}, tokens={estimated_tokens}, "
+                f"content='{chunk[:50]}...'"
+            )
+            filtered_count += 1
+            continue
+
+        kept_chunks.append(chunk)
+
+    # 重新组合保留的 chunks
+    filtered_text = split_by_character.join(kept_chunks)
+
+    # 统计信息
+    kept_count = len(kept_chunks)
+    filter_rate = filtered_count / original_count if original_count > 0 else 0.0
+
+    stats = {
+        "original_chunks": original_count,
+        "filtered_chunks": filtered_count,
+        "kept_chunks": kept_count,
+        "filter_rate": round(filter_rate, 3),
+    }
+
+    logger.info(
+        f"Chunk quality filter complete: "
+        f"original={original_count}, filtered={filtered_count}, "
+        f"kept={kept_count}, filter_rate={filter_rate:.1%}"
+    )
+
+    if filtered_count > original_count * 0.5:
+        logger.warning(
+            f"⚠️  Over 50% of chunks were filtered ({filter_rate:.1%}). "
+            "This may indicate poor document quality or overly strict filter settings."
+        )
+
+    return filtered_text, stats
+
+
 def encode_image_to_base64(image_path: str) -> str:
     """
     Encode image file to base64 string
