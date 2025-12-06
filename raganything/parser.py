@@ -610,7 +610,7 @@ class TianshuParser(Parser):
     def __init__(
         self,
         tianshu_url: str = "http://localhost:8000",
-        poll_interval: float = 2.0,
+        poll_interval: float = 5.0,
         timeout: int = 3600,
         upload_images: bool = False,
     ) -> None:
@@ -641,11 +641,13 @@ class TianshuParser(Parser):
                 from requests.adapters import HTTPAdapter
                 from urllib3.util.retry import Retry
                 retry_strategy = Retry(
-                    total=3,
-                    backoff_factor=1,
+                    total=10,
+                    backoff_factor=2,
                     status_forcelist=[500, 502, 503, 504],
+                    allowed_methods=["GET", "POST"],
+                    raise_on_status=False,
                 )
-                adapter = HTTPAdapter(max_retries=retry_strategy)
+                adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
                 self._session.mount("http://", adapter)
                 self._session.mount("https://", adapter)
             except ImportError:
@@ -768,10 +770,22 @@ class TianshuParser(Parser):
                 else:
                     raise RuntimeError(f"[Tianshu] Unknown task status: {status}")
 
+            except RuntimeError:
+                # Task failed 或 unknown status，不重试，直接抛出
+                raise
             except Exception as e:
-                if "timed out" in str(e).lower() or "timeout" in str(e).lower():
-                    logging.warning(f"[Tianshu] Poll request timed out, retrying...")
-                    time.sleep(self.poll_interval)
+                error_str = str(e).lower()
+                is_retryable = (
+                    "timed out" in error_str or
+                    "timeout" in error_str or
+                    "connection" in error_str or
+                    "remotedisconnected" in error_str or
+                    "connectionerror" in error_str or
+                    "connection aborted" in error_str
+                )
+                if is_retryable:
+                    logging.warning(f"[Tianshu] Poll request failed ({type(e).__name__}), retrying...")
+                    time.sleep(self.poll_interval * 2)  # 连接错误时等待更长时间
                 else:
                     raise
 
